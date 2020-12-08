@@ -69,30 +69,30 @@ function Base.isempty(::ChoiceMap)
     true
 end
 
-get_submap(choices::ChoiceMap, addr) = EmptyChoiceMap()
-has_value(choices::ChoiceMap, addr) = false
-get_value(choices::ChoiceMap, addr) = throw(KeyError(addr))
-Base.getindex(choices::ChoiceMap, addr) = get_value(choices, addr)
+@inline get_submap(choices::ChoiceMap, addr) = EmptyChoiceMap()
+@inline has_value(choices::ChoiceMap, addr) = false
+@inline get_value(choices::ChoiceMap, addr) = throw(KeyError(addr))
+@inline Base.getindex(choices::ChoiceMap, addr) = get_value(choices, addr)
 
-function _has_value(choices::T, addr::Pair) where {T <: ChoiceMap}
+@inline function _has_value(choices::T, addr::Pair) where {T <: ChoiceMap}
     (first, rest) = addr
     submap = get_submap(choices, first)
     has_value(submap, rest)
 end
 
-function _get_value(choices::T, addr::Pair) where {T <: ChoiceMap}
+@inline function _get_value(choices::T, addr::Pair) where {T <: ChoiceMap}
     (first, rest) = addr
     submap = get_submap(choices, first)
     get_value(submap, rest)
 end
 
-function _get_submap(choices::T, addr::Pair) where {T <: ChoiceMap}
+@inline function _get_submap(choices::T, addr::Pair) where {T <: ChoiceMap}
     (first, rest) = addr
     submap = get_submap(choices, first)
     get_submap(submap, rest)
 end
 
-function _print(io::IO, choices::ChoiceMap, pre, vert_bars::Tuple)
+function _show_pretty(io::IO, choices::ChoiceMap, pre, vert_bars::Tuple)
     VERT = '\u2502'
     PLUS = '\u251C'
     HORZ = '\u2500'
@@ -115,6 +115,8 @@ function _print(io::IO, choices::ChoiceMap, pre, vert_bars::Tuple)
     n = length(key_and_values) + length(key_and_submaps)
     cur = 1
     for (key, value) in key_and_values
+        # For strings, `print` is what we want; `Base.show` includes quote marks.
+        # https://docs.julialang.org/en/v1/base/io-network/#Base.print
         print(io, indent_vert_str)
         print(io, (cur == n ? indent_last_str : indent_str) * "$(repr(key)) : $value\n")
         cur += 1
@@ -122,13 +124,13 @@ function _print(io::IO, choices::ChoiceMap, pre, vert_bars::Tuple)
     for (key, submap) in key_and_submaps
         print(io, indent_vert_str)
         print(io, (cur == n ? indent_last_str : indent_str) * "$(repr(key))\n")
-        _print(io, submap, pre + 4, cur == n ? (vert_bars...,) : (vert_bars..., pre+1))
+        _show_pretty(io, submap, pre + 4, cur == n ? (vert_bars...,) : (vert_bars..., pre+1))
         cur += 1
     end
 end
 
-function Base.print(io::IO, choices::ChoiceMap)
-    _print(io, choices, 0, ())
+function Base.show(io::IO, ::MIME"text/plain", choices::ChoiceMap)
+    _show_pretty(io, choices, 0, ())
 end
 
 # assignments that have static address schemas should also support faster
@@ -499,7 +501,7 @@ end
         push!(internal_node_names, node)
         push!(exprs, quote
             (n_read, $node) = _from_array(proto_choices.internal_nodes.$key, arr, idx)
-            idx += n_read 
+            idx += n_read
         end)
     end
 
@@ -623,7 +625,11 @@ end
 
 function DynamicChoiceMap(tuples...)
     choices = DynamicChoiceMap()
-    for (addr, value) in tuples 
+    for tuple in tuples
+        if length(tuple) != 2
+            error("Constructor accepts tuples of the form (address, value) only")
+        end
+        (addr, value) = tuple
         choices[addr] = value
     end
     choices
@@ -886,3 +892,122 @@ _fill_array!(::EmptyChoiceMap, arr::Vector, start_idx::Int) = 0
 _from_array(::EmptyChoiceMap, arr::Vector, start_idx::Int) = (0, EmptyChoiceMap())
 
 export EmptyChoiceMap
+
+############################################
+# Nested-dict–like accessor for choicemaps #
+############################################
+
+"""
+Wrapper for a `ChoiceMap` that provides nested-dict–like syntax, rather than
+the default syntax which looks like a flat dict of full keypaths.
+
+```jldoctest
+julia> using Gen
+julia> c = choicemap((:a, 1),
+                     (:b => :c, 2));
+julia> cv = nested_view(c);
+julia> c[:a] == cv[:a]
+true
+julia> c[:b => :c] == cv[:b][:c]
+true
+julia> length(cv)
+2
+julia> length(cv[:b])
+1
+julia> sort(collect(keys(cv)))
+[:a, :b]
+julia> sort(collect(keys(cv[:b])))
+[:c]
+```
+"""
+struct ChoiceMapNestedView
+    choice_map::ChoiceMap
+end
+
+function Base.getindex(choices::ChoiceMapNestedView, addr)
+    if has_value(choices.choice_map, addr)
+        return get_value(choices.choice_map, addr)
+    end
+    submap = get_submap(choices.choice_map, addr)
+    if isempty(submap)
+        throw(KeyError(addr))
+    end
+    ChoiceMapNestedView(submap)
+end
+
+function Base.iterate(c::ChoiceMapNestedView)
+    inner_iterator = Base.Iterators.flatten((
+        get_values_shallow(c.choice_map),
+        ((k, ChoiceMapNestedView(v))
+         for (k, v) in get_submaps_shallow(c.choice_map))))
+    r = Base.iterate(inner_iterator)
+    if r == nothing
+        return nothing
+    end
+    (next_kv, next_inner_state) = r
+    (next_kv, (inner_iterator, next_inner_state))
+end
+
+function Base.iterate(c::ChoiceMapNestedView, state)
+    (inner_iterator, inner_state) = state
+    r = Base.iterate(inner_iterator, inner_state)
+    if r == nothing
+        return nothing
+    end
+    (next_kv, next_inner_state) = r
+    (next_kv, (inner_iterator, next_inner_state))
+end
+
+# TODO: Allow different implementations of this method depending on the
+# concrete type of the `ChoiceMap`, so that an already-existing data structure
+# with faster key lookup (analogous to `Base.KeySet`) can be exposed if it
+# exists.
+Base.keys(cv::Gen.ChoiceMapNestedView) = (k for (k, v) in cv)
+
+function Base.:(==)(a::ChoiceMapNestedView, b::ChoiceMapNestedView)
+  a.choice_map == b.choice_map
+end
+
+# Length of a `ChoiceMapNestedView` is number of leaf values + number of
+# submaps.  Motivation: This matches what `length` would return for the
+# equivalent nested dict.
+function Base.length(cv::ChoiceMapNestedView)
+  +(get_values_shallow(cv.choice_map) |> collect |> length,
+    get_submaps_shallow(cv.choice_map) |> collect |> length)
+end
+
+function Base.show(io::IO, ::MIME"text/plain", c::ChoiceMapNestedView)
+    Base.show(io, MIME"text/plain"(), c.choice_map)
+end
+
+nested_view(c::ChoiceMap) = ChoiceMapNestedView(c)
+
+# TODO(https://github.com/probcomp/Gen/issues/167): Also allow calling
+# `nested_view(::Trace)`, to get a nested-dict–like view of the choicemap and
+# aux data together.
+
+export nested_view
+
+"""
+    selected_choices = get_selected(choices::ChoiceMap, selection::Selection)
+
+Filter the choice map to include only choices in the given selection.
+
+Returns a new choice map.
+"""
+function get_selected(
+        choices::ChoiceMap, selection::Selection)
+    output = choicemap()
+    for (key, value) in get_values_shallow(choices)
+        if (key in selection)
+            output[key] = value
+        end
+    end
+    for (key, submap) in get_submaps_shallow(choices)
+        subselection = selection[key]
+        set_submap!(output, key, get_selected(submap, subselection))
+    end
+    output
+end
+
+export get_selected

@@ -1,12 +1,12 @@
 # Built-in Modeling Language
 
 Gen provides a built-in embedded modeling language for defining generative functions.
-The language uses a syntax that extends Julia's syntax for defining regular Julia functions.
+The language uses a syntax that extends Julia's syntax for defining regular Julia functions, and is also referred to as the **Dynamic Modeling Language**.
 
 Generative functions in the modeling language are identified using the `@gen` keyword in front of a Julia function definition.
 Here is an example `@gen` function that samples two random choices:
 ```julia
-@gen function foo(prob::Float64)
+@gen function foo(prob::Float64=0.1)
     z1 = @trace(bernoulli(prob), :a)
     z2 = @trace(bernoulli(prob), :b)
     return z1 || z2
@@ -17,6 +17,8 @@ After running this code, `foo` is a Julia value of type [`DynamicDSLFunction`](@
 DynamicDSLFunction
 ```
 
+Note that it is possible to provide default values for trailing positional arguments. However, keyword arguments are currently *not* supported.
+
 We can call the resulting generative function like we would a regular Julia function:
 ```julia
 retval::Bool = foo(0.5)
@@ -25,10 +27,16 @@ We can also trace its execution:
 ```julia
 (trace, _) = generate(foo, (0.5,))
 ```
+Optional arguments can be left out of the above operations, and default values will be filled in automatically:
+```julia
+julia> (trace, _) = generate(foo, (,));
+julia> get_args(trace)
+(0.1,)
+```
 See [Generative Functions](@ref) for the full set of operations supported by a generative function.
 Note that the built-in modeling language described in this section is only one of many ways of defining a generative function -- generative functions can also be constructed using other embedded languages, or by directly implementing the methods of the generative function interface.
 However, the built-in modeling language is intended to being flexible enough cover a wide range of use cases.
-In the remainder of this section, we refer to generative functions defined using the built-in modeling language as `@gen` functions.
+In the remainder of this section, we refer to generative functions defined using the built-in modeling language as `@gen` functions. Details about the implementation of `@gen` functions can be found in the [Modeling Language Implementation](@ref) section.
 
 ## Annotations
 
@@ -89,11 +97,34 @@ val::Bool = @trace(bernoulli(0.5), :z)
 Not all random choices need to be given addresses.
 An address is required if the random choice will be observed, or will be referenced by a custom inference algorithm (e.g. if it will be proposed to by a custom proposal distribution).
 
-### Choices should have constant support
-The support of a random choice at a given address (the set of values with nonzero probability or probability density) must be constant across all possible executions of the `@gen` function.
-Violating this discipline will cause errors in certain cases.
-If the support of a random choice needs to change, use a different address for each distinct value of the support.
-For example, consider the following generative function:
+
+### Sample space and support of random choices
+
+Different probability distributions produce different types of values for their random choices. For example, the [`bernoulli`](@ref) distribution results in `Bool` values (either `true` or `false`), the [`normal`](@ref) distribution results in `Real` values that may be positive or negative, and the [`beta`](@ref) distribution result in `Real` values that are always in the unit interval (0, 1).
+
+Each `Distribution` is associated with two sets of values:
+
+- The **sample space** of the distribution, which does not depend on the arguments.
+
+- The **support** of the distribution, which may depend on the arguments, and is the set of values that has nonzero probability (or probability density). It may be the entire sample space, or it may be a subset of the sample space.
+
+For example, the sample space of [`bernoulli`](@ref) is `Bool` and its support is either `{true}`, `{false}`, or `{true, false}`. The sample space of [`normal`](@ref) is `Real` and its support is the set of all values on the real line. The sample space of [`beta`](@ref) is `Real` and its support is the set of values in the interval (0, 1).
+
+Gen's built in modeling languages require that a address is associated with a fixed sample space. For example, it is not permitted to use a `bernoulli` distribution to sample at addresss `:a` in one execution, and a `normal` distribution to sample at address `:a` in a different execution, because their sample spaces differ (`Bool` vs `Real`):
+```julia
+@gen function foo()
+    if @trace(bernoulli(0.5), :branch)
+        @trace(bernoulli(0.5), :x)
+    else
+        @trace(normal(0, 1), :x)
+    end
+end
+```
+
+A generative function can be **disciplined** or not. In a disciplined generative function, the support of random choices at each address must be fixed. That is, for each address `a` there must exist a set S that is a subset of the sample space such that for all executions of the generative function, if `a` occurs as the address of a choice in the execution, then the support of that choice is exactly S. Violating this discipline will cause NaNs, errors, or undefined behavior in some inference programs. However, in many cases it is convenient to write an inference program that operates correctly and efficiently on some specialized class of undisciplined models.
+In these cases, authors who want their inference code to be reusable should consider documenting which kinds of undisciplined models their inference algorithms allow or expect to see.
+
+If the support of a random choice needs to change, a disciplined generative function can represent this by using a different address for each distinct value of the support. For example, consider the following generative function:
 ```julia
 @gen function foo()
     n = @trace(categorical([0.5, 0.5]), :n) + 1
@@ -101,19 +132,12 @@ For example, consider the following generative function:
 end
 ```
 The support of the random choice with address `:x` is either the set ``\{1, 2\}`` or ``\{1, 2, 3\}``.
-Therefore, this random choice does satisfy our condition above.
-This would cause an error with the following, in which the `:n` address is modified, which could result in a change to the domain of the `:x` variable:
+Therefore, this random choice does not have constant support, and the generative function `foo` is not 'disciplined'.
+Specifically, this could result in undefined behavior for the following inference program:
 ```julia
-tr, _ = generate(foo, (), choicemap((:n, 2), (:x, 3)))
-tr, _ = mh(tr, select(:n))
+tr, _ = importance_resampling(foo, (), choicemap((:x, 3)))
 ```
-We can modify the address to satisfy the condition by including the domain in the address:
-```julia
-@gen function foo()
-    n = @trace(categorical([0.5, 0.5]), :n) + 1
-    @trace(categorical(ones(n) / n), (:x, n))
-end
-```
+It is recommended to write disciplined generative functions when possible.
 
 ## Calling generative functions
 
@@ -188,6 +212,37 @@ This example is **valid** because `:a => :b` and `:a => :c` are not prefixes of 
 @trace(foo(0.5), :a => :c)
 ```
 
+## Tilde syntax
+
+As a short-hand for `@trace` expressions, the tilde operator `~` can also be used to make random choices and traced calls to generative functions. For example, the expression
+```julia
+{:x} ~ normal(0, 1)
+```
+is equivalent to:
+```julia
+@trace(normal(0, 1), :x)
+```
+
+One can also conveniently assign random values to variables using the syntax:
+```julia
+x ~ normal(0, 1)
+```
+which is equivalent to:
+```julia
+x = @trace(normal(0, 1), :x)
+```
+
+Finally, one can make traced calls using a shared address namespace with the syntax:
+```julia
+{*} ~ foo(0.5)
+```
+which is equivalent to:
+```julia
+@trace(foo(0.5))
+```
+
+Note that `~` is also defined in `Base` as a unary operator that performs the bitwise-not operation (see [`Base.:~`](https://docs.julialang.org/en/v1/base/math/#Base.:~)). This use of `~` is also supported within `@gen` functions. However, uses of `~` as a *binary* infix operator within an `@gen` function will *always* be treated as equivalent to an `@trace` expression. If your module contains its own two-argument definition `YourModule.:~(a, b)` of the `~` function, calls to that function within `@gen` functions have to be in qualified prefix form, i.e., you have to write `YourModule.:~(a, b)` instead of `a ~ b`.
+
 ## Return value
 
 Like regular Julia functions, `@gen` functions return either the expression used in a `return` keyword, or by evaluating the last expression in the function body.
@@ -211,7 +266,7 @@ end
 Trainable parameters obey the same scoping rules as Julia local variables defined at the beginning of the function body.
 The value of a trainable parameter is undefined until it is initialized using [`init_param!`](@ref).
 In addition to the current value, each trainable parameter has a current **gradient accumulator** value.
-The gradent accumulator value has the same shape (e.g. array dimension) as the parameter value.
+The gradient accumulator value has the same shape (e.g. array dimension) as the parameter value.
 It is initialized to all zeros, and is incremented by [`accumulate_param_gradients!`](@ref).
 
 The following methods are exported for the trainable parameters of `@gen` functions:
@@ -354,8 +409,8 @@ For the function `foo` above, the static graph looks like:
 ```
 In this graph, oval nodes represent random choices, square nodes represent Julia computations, and diamond nodes represent arguments.
 The light blue shaded node is the return value of the function.
-Having access to the static graph allows Gen to generate specialized code for [Trace update operations](@ref) that skips unecessary parts of the computation.
-Specifically, when applying an update operation, a the graph is analyzed, and each value in the graph identified as having possibly changed, or not.
+Having access to the static graph allows Gen to generate specialized code for [Updating traces](@ref) that skips unecessary parts of the computation.
+Specifically, when applying an update operation, the graph is analyzed, and each value in the graph identified as having possibly changed, or not.
 Nodes in the graph do not need to be re-executed if none of their input values could have possibly changed.
 Also, even if some inputs to a generative function node may have changed, knowledge that some of the inputs have not changed often allows the generative function being called to more efficiently perform its update operation.
 This is the case for functions produced by [Generative Function Combinators](@ref).
@@ -371,57 +426,101 @@ This will produce a file `test.pdf` in the current working directory containing 
 
 ### Restrictions
 
-In order to be able to construct the static graph, Gen restricts the permitted syntax that can be used in functions annotated with `static`.
+First, the definition of a `(static)` generative function is always expected to occur as a [top-level definition](https://docs.julialang.org/en/v1/manual/modules/) (aka global variable); usage in non–top-level scopes is unsupported and may result in incorrect behavior.
+Recall also that the macro [`@load_generated_functions`](@ref) is expected to be called as a top-level expression only.
+
+Next, in order to be able to construct the static graph, Gen restricts the permitted syntax that can be used in functions annotated with `static`.
 In particular, each statement in the body must be one of the following:
 
-- A pure functional Julia expression on the right-hand side, and a symbol on the left-hand side, e.g.:
+- A `@param` statement specifying any [Trainable parameters](@ref), e.g.:
 
 ```julia
-z4 = !z3
+@param theta::Float64
 ```
 
-- A `@trace` expression on the right-hand side, and a symbol on the left-hand side, e.g.:
+- An assignment, with a symbol or tuple of symbols on the left-hand side, and a Julia expression on the right-hand side, which may include `@trace` expressions, e.g.:
 
 ```julia
-z2 = @trace(bernoulli(prob), :b)
+mu, sigma = @trace(bernoulli(p), :x) ? (mu1, sigma1) : (mu2, sigma2)
 ```
-The trace statement must use a literal Julia symbol for the first component in the address. Unlike the full built-in modeling-language, the address is not optional.
 
-- A `return` statement, with a literal Julia symbol on the right-hand side, e.g.:
+- A top-level `@trace` expression, e.g.:
 
 ```julia
-return z4
+@trace(bernoulli(1-prob_tails), :flip)
+```
+All `@trace` expressions must use a literal Julia symbol for the first component in the address. Unlike the full built-in modeling-language, the address is not optional.
+
+- A `return` statement, with a Julia expression on the right-hand side, e.g.:
+
+```julia
+return @trace(geometric(prob), :n_flips) + 1
 ```
 
-The functions must also satisfy the following rules: 
+The functions are also subject to the following restrictions:
 
-- `@trace` expressions cannot appear anywhere in the function body except for as the outer-most expression on the right-hand side of a statement.
+- Default argument values are not supported.
 
-- Each literal symbol used in the left-hand side of a statement must be unique (e.g. you cannot re-assign to a variable).
+- Julia closures are not allowed.
 
-- Julia closures and list comprehensions are not allowed.
+- List comprehensions with internal `@trace` calls are not allowed.
+
+- Splatting within `@trace` calls is not supported
+
+- Generative functions that are passed in as arguments cannot be traced.
 
 - For composite addresses (e.g. `:a => 2 => :c`) the first component of the address must be a literal symbol, and there may only be one statement in the function body that uses this symbol for the first component of its address.
 
-- Julia control flow constructs (e.g. `if`, `for`, `while`) cannot be used as top-level statements in the function body. Control flow should be implemented inside Julia functions that are called, generative functions that are called such as generative functions produced using [Generative Function Combinators](@ref).
+- Julia control flow constructs (e.g. `if`, `for`, `while`) cannot be used as top-level statements in the function body. Control flow should be implemented inside either Julia functions that are called, or other generative functions.
+
+Certain loop constructs can be implemented using [Generative Function Combinators](@ref) instead. For example, the following loop:
+```julia
+for (i, prob) in enumerate(probs)
+    @trace(foo(prob), :foo => i)
+end
+```
+can instead be implemented as:
+```julia
+@trace(Map(foo)(probs), :foo)
+```
 
 ### Loading generated functions
-Before a function with a static annotation can be used, the [`load_generated_functions`](@ref) method must be called:
+Before a function with a static annotation can be used, the [`@load_generated_functions`](@ref) macro must be called:
 ```@docs
-load_generated_functions
+@load_generated_functions
 ```
 Typically, one call to this function, at the top level of a script, separates the definition of generative functions from the execution of inference code, e.g.:
 ```julia
-using Gen: load_generated_functions
+using Gen: @load_generated_functions
 
 # define generative functions and inference code
 ..
 
 # allow static generative functions defined above to be used
-load_generated_functions()
+@load_generated_functions()
 
 # run inference code
 ..
+```
+
+When static generative functions are defined in a Julia module, [`@load_generated_functions`](@ref) should be called after all static functions are defined:
+
+```julia
+module MyModule
+using Gen
+# Include code that defines static generative functions
+include("my_static_gen_functions.jl")
+# Load generated functions defined in this module
+@load_generated_functions()
+end
+```
+
+Any script that imports or uses `MyModule` will then no longer need to call `@load_generated_functions` in order to use the static generative functions defined in that module:
+
+```julia
+using Gen
+using MyModule: my_static_gen_fn
+trace = simulate(my_static_gen_fn, ())
 ```
 
 ### Performance tips
@@ -430,6 +529,6 @@ This permits a more optimized trace data structure to be generated for the gener
 
 ### Caching Julia values
 
-By default, the values of Julia computations (all calls that are not random choices or calls to generative functions) are cached as part of the trace, so that [Trace update operations](@ref) can avoid unecessary re-execution of Julia code.
+By default, the values of Julia computations (all calls that are not random choices or calls to generative functions) are cached as part of the trace, so that [Updating traces](@ref) can avoid unecessary re-execution of Julia code.
 However, this cache may grow the memory footprint of a trace.
 To disable caching of Julia values, use the function annotation `nojuliacache` (this annotation is ignored unless the `static` function annotation is also used).

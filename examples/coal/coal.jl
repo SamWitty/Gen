@@ -1,15 +1,10 @@
 using PyPlot
-using ReverseDiff: jacobian
-using LinearAlgebra: det
-
 using Gen
 
-# Example from Section 4 of Reversible jump Markov chain Monte Carlo
-# computation and Bayesian model determination 
+include("poisson_process.jl")
 
-########################
-# custom distributions #
-########################
+# Example from Section 4 of Reversible jump Markov chain Monte Carlo
+# computation and Bayesian model determination
 
 # minimum of k draws from uniform_continuous(lower, upper)
 
@@ -36,76 +31,6 @@ function Gen.random(::MinUniformContinuous, lower::T, upper::U, k::Int) where {T
     p = rand()
     upper - (upper - lower) * (1. - p)^(1. / k)
 end
-
-
-# piecewise homogenous Poisson process 
-
-# n intervals - n + 1 bounds
-# (b_1, b_2]
-# (b_2, b_3]
-# ..
-# (b_n, b_{n+1}]
-
-function compute_total(bounds, rates)
-    num_intervals = length(rates)
-    if length(bounds) != num_intervals + 1
-        error("Number of bounds does not match number of rates")
-    end
-    total = 0.
-    bounds_ascending = true
-    for i=1:num_intervals
-        lower = bounds[i]
-        upper = bounds[i+1]
-        rate = rates[i]
-        len = upper - lower
-        if len <= 0
-            bounds_ascending = false
-        end
-        total += len * rate
-    end
-    (total, bounds_ascending)
-end
-
-struct PiecewiseHomogenousPoissonProcess <: Distribution{Vector{Float64}} end
-const piecewise_poisson_process = PiecewiseHomogenousPoissonProcess()
-
-function Gen.logpdf(::PiecewiseHomogenousPoissonProcess, x::Vector{Float64}, bounds::Vector{Float64}, rates::Vector{Float64})
-    cur = 1
-    upper = bounds[cur+1]
-    lpdf = 0.
-    for xi in sort(x)
-        if xi < bounds[1] || xi > bounds[end]
-            error("x ($xi) lies outside of interval")
-        end
-        while xi > upper 
-            cur += 1
-            upper = bounds[cur+1]
-        end
-        lpdf += log(rates[cur])
-    end
-    (total, bounds_ascending) = compute_total(bounds, rates)
-    if bounds_ascending
-        lpdf - total
-    else
-        -Inf
-    end
-end
-
-function Gen.random(::PiecewiseHomogenousPoissonProcess, bounds::Vector{Float64}, rates::Vector{Float64})
-    x = Vector{Float64}()
-    num_intervals = length(rates)
-    for i=1:num_intervals
-        lower = bounds[i]
-        upper = bounds[i+1]
-        rate = (upper - lower) * rates[i]
-        n = random(poisson, rate)
-        for j=1:n
-            push!(x, random(uniform_continuous, lower, upper))
-        end
-    end
-    x
-end
-
 
 #########
 # model #
@@ -187,26 +112,26 @@ end
     # propose new value for the rate
     cur_rate = trace[(RATE, i)]
     @trace(uniform_continuous(cur_rate/2., cur_rate*2.), :new_rate)
+
+    nothing
 end
 
 # it is an involution because it:
 # - maintains i = fwd_choices[:i] constant
 # - swaps choices[(RATE, i)] with fwd_choices[:new_rate]
 
-function rate_involution(trace, fwd_choices::ChoiceMap, fwd_ret, proposal_args::Tuple)
-    model_args = get_args(trace)
-    bwd_choices = choicemap()
-    constraints = choicemap()
-    i = fwd_choices[:i]
-    bwd_choices[:i] = i
-    constraints[(RATE, i)] = fwd_choices[:new_rate]
-    bwd_choices[:new_rate] = trace[(RATE, i)]
-    (new_trace, weight, _, _) = update(trace, model_args, (NoChange(),), constraints)
-    (new_trace, bwd_choices, weight)
+@transform rate_involution() (model_in, aux_in) to (model_out, aux_out) begin
+    i = @read(aux_in[:i], :discrete)
+    @write(aux_out[:i], i, :discrete)
+    new_rate = @read(aux_in[:new_rate], :continuous)
+    @write(model_out[(RATE, i)], new_rate, :continuous)
+    prev_rate = @read(model_in[(RATE, i)], :continuous)
+    @write(aux_out[:new_rate], prev_rate, :continuous)
 end
 
-rate_move(trace) = metropolis_hastings(trace, rate_proposal, (), rate_involution, check_round_trip=true)
+is_involution!(rate_involution)
 
+rate_move(trace) = metropolis_hastings(trace, rate_proposal, (), rate_involution, check=true)
 
 #################
 # position move #
@@ -222,25 +147,24 @@ rate_move(trace) = metropolis_hastings(trace, rate_proposal, (), rate_involution
     lower = (i == 1) ? 0. : trace[(CHANGEPT, i-1)]
     upper = (i == k) ? T : trace[(CHANGEPT, i+1)]
     @trace(uniform_continuous(lower, upper), :new_changept)
+
+    i
 end
 
 # it is an involution because it:
 # - maintains i = fwd_choices[:i] constant
 # - swaps choices[(CHANGEPT, i)] with fwd_choices[:new_changept]
 
-function position_involution(trace, fwd_choices::ChoiceMap, fwd_ret, proposal_args::Tuple)
-    model_args = get_args(trace)
-    bwd_choices = choicemap()
-    constraints = choicemap()
-    i = fwd_choices[:i]
-    bwd_choices[:i] = i
-    constraints[(CHANGEPT, i)] = fwd_choices[:new_changept]
-    bwd_choices[:new_changept] = trace[(CHANGEPT, i)]
-    (new_trace, weight, _, _) = update(trace, model_args, (NoChange(),), constraints)
-    (new_trace, bwd_choices, weight)
+@transform position_involution (model_in, aux_in) to (model_out, aux_out) begin
+    i = @read(aux_in[:i], :discrete)
+    @write(aux_out[:i], i, :discrete)
+    @copy(model_in[(CHANGEPT, i)], aux_out[:new_changept])
+    @copy(aux_in[:new_changept], model_out[(CHANGEPT, i)])
 end
 
-position_move(trace) = metropolis_hastings(trace, position_proposal, (), position_involution, check_round_trip=true)
+is_involution!(position_involution)
+
+position_move(trace) = metropolis_hastings(trace, position_proposal, (), position_involution, check=true)
 
 
 ######################
@@ -277,10 +201,10 @@ const U = :u
         # changepoints after move:      | 1     2    3 |
         @trace(uniform_discrete(1, k), CHOSEN)
     end
+    nothing
 end
 
-function new_rates(arr)
-    (cur_rate, u, cur_cp, prev_cp, next_cp) = arr
+function new_rates(cur_rate, u, cur_cp, prev_cp, next_cp)
     d_prev = cur_cp - prev_cp
     d_next = next_cp - cur_cp
     @assert d_prev > 0
@@ -292,11 +216,10 @@ function new_rates(arr)
     next_rate = exp(log_cur_rate + (d_prev / d_total) * log_ratio)
     @assert prev_rate > 0.
     @assert next_rate > 0.
-    [prev_rate, next_rate]
+    (prev_rate, next_rate)
 end
 
-function new_rates_inverse(arr)
-    (prev_rate, next_rate, cur_cp, prev_cp, next_cp) = arr
+function new_rates_inverse(prev_rate, next_rate, cur_cp, prev_cp, next_cp)
     d_prev = cur_cp - prev_cp
     d_next = next_cp - cur_cp
     @assert d_prev > 0
@@ -307,7 +230,7 @@ function new_rates_inverse(arr)
     cur_rate = exp((d_prev / d_total) * log_prev_rate + (d_next / d_total) * log_next_rate)
     u = prev_rate / (prev_rate + next_rate)
     @assert cur_rate > 0.
-    [cur_rate, u]
+    (cur_rate, u)
 end
 
 # it is an involution because:
@@ -316,92 +239,92 @@ end
 #   changepoint and then remove that same changepoint)
 # - new_rates, curried on cp_new, cp_prev, and cp_next, is the inverse of new_rates_inverse.
 
-function birth_death_involution(trace, fwd_choices::ChoiceMap, fwd_ret, proposal_args::Tuple)
-    model_args = get_args(trace)
-    T = model_args[1]
-
-    bwd_choices = choicemap()
+@transform birth_death_involution (model_in, aux_in) to (model_out, aux_out) begin
+    T = get_args(model_in)[1]
 
     # current number of changepoints
-    k = trace[K]
-    
+    k = @read(model_in[K], :discrete)
+
     # if k == 0, then we can only do a birth move
-    isbirth = (k == 0) || fwd_choices[IS_BIRTH]
+    isbirth = (k == 0) || @read(aux_in[IS_BIRTH], :discrete)
 
     # if we are a birth move, the inverse is a death move
     if k > 1 || isbirth
-        bwd_choices[IS_BIRTH] = !isbirth
+        @write(aux_out[IS_BIRTH], !isbirth, :discrete)
     end
-    
+
     # the changepoint to be added or deleted
-    i = fwd_choices[CHOSEN]
-    bwd_choices[CHOSEN] = i
+    i = @read(aux_in[CHOSEN], :discrete)
+    @copy(aux_in[CHOSEN], aux_out[CHOSEN])
 
-    # populate constraints
-    constraints = choicemap()
     if isbirth
-        constraints[K] = k + 1
-
-        cp_new = fwd_choices[NEW_CHANGEPT]
-        cp_prev = (i == 1) ? 0. : trace[(CHANGEPT, i-1)]
-        cp_next = (i == k+1) ? T : trace[(CHANGEPT, i)]
-
-        # set new changepoint
-        constraints[(CHANGEPT, i)] = cp_new
-
-        # shift up changepoints
-        for j=i+1:k+1
-            constraints[(CHANGEPT, j)] = trace[(CHANGEPT, j-1)]
-        end
-
-        # compute new rates
-        h_cur = trace[(RATE, i)]
-        u = fwd_choices[U]
-        (h_prev, h_next) = new_rates([h_cur, u, cp_new, cp_prev, cp_next])
-        J = jacobian(new_rates, [h_cur, u, cp_new, cp_prev, cp_next])[:,1:2]
-
-        # set new rates
-        constraints[(RATE, i)] = h_prev
-        constraints[(RATE, i+1)] = h_next
-
-        # shift up rates
-        for j=i+2:k+2
-            constraints[(RATE, j)] = trace[(RATE, j-1)]
-        end
+        @tcall(birth(k, i))
     else
-        constraints[K] = k - 1
-
-        cp_deleted = trace[(CHANGEPT, i)]
-        cp_prev = (i == 1) ? 0. : trace[(CHANGEPT, i-1)]
-        cp_next = (i == k) ? T : trace[(CHANGEPT, i+1)]
-        bwd_choices[NEW_CHANGEPT] = cp_deleted 
-
-        # shift down changepoints
-        for j=i:k-1
-            constraints[(CHANGEPT, j)] = trace[(CHANGEPT, j+1)]
-        end
-
-        # compute cur rate and u
-        h_prev = trace[(RATE, i)]
-        h_next = trace[(RATE, i+1)]
-        (h_cur, u) = new_rates_inverse([h_prev, h_next, cp_deleted, cp_prev, cp_next])
-        J = jacobian(new_rates_inverse, [h_prev, h_next, cp_deleted, cp_prev, cp_next])[:,1:2]
-        bwd_choices[U] = u
-
-        # set cur rate
-        constraints[(RATE, i)] = h_cur
-
-        # shift down rates
-        for j=i+1:k
-            constraints[(RATE, j)] = trace[(RATE, j+1)]
-        end
+        @tcall(death(k, i))
     end
-
-    (new_trace, weight, _, _) = update(trace, model_args, (NoChange(),), constraints)
-    (new_trace, bwd_choices, weight + log(abs(det(J))))
 end
 
-birth_death_move(trace) = metropolis_hastings(trace, birth_death_proposal, (), birth_death_involution, check_round_trip=true)
+@transform birth(k::Int, i::Int) (model_in, aux_in) to (model_out, aux_out) begin
+    @write(model_out[K], k+1, :discrete)
+
+    cp_new = @read(aux_in[NEW_CHANGEPT], :continuous)
+    cp_prev = (i == 1) ? 0. : @read(model_in[(CHANGEPT, i-1)], :continuous)
+    cp_next = (i == k+1) ? T : @read(model_in[(CHANGEPT, i)], :continuous)
+
+    # set new changepoint
+    @copy(aux_in[NEW_CHANGEPT], model_out[(CHANGEPT, i)])
+
+    # shift up changepoints
+    for j=i+1:k+1
+        @copy(model_in[(CHANGEPT, j-1)], model_out[(CHANGEPT, j)])
+    end
+
+    # compute new rates
+    h_cur = @read(model_in[(RATE, i)], :continuous)
+    u = @read(aux_in[U], :continuous)
+    (h_prev, h_next) = new_rates(h_cur, u, cp_new, cp_prev, cp_next)
+
+    # set new rates
+    @write(model_out[(RATE, i)], h_prev, :continuous)
+    @write(model_out[(RATE, i+1)], h_next, :continuous)
+
+    # shift up rates
+    for j=i+2:k+2
+        @copy(model_in[(RATE, j-1)], model_out[(RATE, j)])
+    end
+end
+
+@transform death(k::Int, i::Int) (model_in, aux_in) to (model_out, aux_out) begin
+    @write(model_out[K], k-1, :discrete)
+
+    cp_deleted = @read(model_in[(CHANGEPT, i)], :continuous)
+    cp_prev = (i == 1) ? 0. : @read(model_in[(CHANGEPT, i-1)], :continuous)
+    cp_next = (i == k) ? T : @read(model_in[(CHANGEPT, i+1)], :continuous)
+    @copy(model_in[(CHANGEPT, i)], aux_out[NEW_CHANGEPT])
+
+    # shift down changepoints
+    for j=i:k-1
+        @copy(model_in[(CHANGEPT, j+1)], model_out[(CHANGEPT, j)])
+    end
+
+    # compute cur rate and u
+    h_prev = @read(model_in[(RATE, i)], :continuous)
+    h_next = @read(model_in[(RATE, i+1)], :continuous)
+    (h_cur, u) = new_rates_inverse(h_prev, h_next, cp_deleted, cp_prev, cp_next)
+    @write(aux_out[U], u, :continuous)
+
+    # set cur rate
+    @write(model_out[(RATE, i)], h_cur, :continuous)
+
+    # shift down rates
+    for j=i+1:k
+        @copy(model_in[(RATE, j+1)], model_out[(RATE, j)])
+    end
+end
+
+is_involution!(birth_death_involution)
+
+birth_death_move(trace) = metropolis_hastings(trace, birth_death_proposal, (), birth_death_involution, check=true)
 
 function mcmc_step(trace)
     (trace, _) = rate_move(trace)
@@ -558,7 +481,7 @@ function plot_trace_plot()
     rate1 = Float64[]
     num_clusters_vec = Int[]
     burn_in = 0
-    for iter=1:burn_in + 1000 
+    for iter=1:burn_in + 1000
         trace = mcmc_step(trace)
         if iter > burn_in
             push!(num_clusters_vec, trace[K])
@@ -572,7 +495,7 @@ function plot_trace_plot()
     rate1 = Float64[]
     num_clusters_vec = Int[]
     burn_in = 0
-    for iter=1:burn_in + 1000 
+    for iter=1:burn_in + 1000
         trace = simple_mcmc_step(trace)
         if iter > burn_in
             push!(num_clusters_vec, trace[K])

@@ -29,7 +29,7 @@ function CallRecord(record::ChoiceOrCallRecord)
     end
     CallRecord(record.subtrace_or_retval, record.score, record.noise)
 end
-    
+
 mutable struct DynamicDSLTrace{T} <: Trace
     gen_fn::T
     trie::Trie{Any,ChoiceOrCallRecord}
@@ -44,8 +44,6 @@ mutable struct DynamicDSLTrace{T} <: Trace
         new(gen_fn, trie, true, 0, 0, args)
     end
 end
-
-DynamicDSLTrace(gen_fn::T, args) where {T} = DynamicDSLTrace{T}(gen_fn, args)
 
 set_retval!(trace::DynamicDSLTrace, retval) = (trace.retval = retval)
 
@@ -97,11 +95,16 @@ function add_call!(trace::DynamicDSLTrace, addr, subtrace)
     trace.noise += noise
 end
 
-# GFI methods
+###############
+# GFI methods #
+###############
+
 get_args(trace::DynamicDSLTrace) = trace.args
 get_retval(trace::DynamicDSLTrace) = trace.retval
 get_score(trace::DynamicDSLTrace) = trace.score
 get_gen_fn(trace::DynamicDSLTrace) = trace.gen_fn
+
+## get_choices ##
 
 function get_choices(trace::DynamicDSLTrace)
     if !trace.isempty
@@ -166,4 +169,42 @@ function get_submaps_shallow(choices::DynamicDSLChoiceMap)
     internal_nodes_iter = ((key, DynamicDSLChoiceMap(trie))
         for (key, trie) in get_internal_nodes(choices.trie))
     Iterators.flatten((calls_iter, internal_nodes_iter))
+end
+
+## Base.getindex ##
+
+function _getindex(trace::DynamicDSLTrace, trie::Trie, addr::Pair)
+    (first, rest) = addr
+    if haskey(trie.leaf_nodes, first)
+        choice_or_call = trie.leaf_nodes[first]
+        if choice_or_call.is_choice
+            error("Unknown address $addr; random choice at $first")
+        else
+            subtrace = choice_or_call.subtrace_or_retval
+            return subtrace[rest]
+        end
+    elseif haskey(trie.internal_nodes, first)
+        return _getindex(trace, trie.internal_nodes[first], rest)
+    else
+        error("No random choice or generative function call at address $addr")
+    end
+end
+
+function _getindex(trace::DynamicDSLTrace, trie::Trie, addr)
+    if haskey(trie.leaf_nodes, addr)
+        choice_or_call = trie.leaf_nodes[addr]
+        if choice_or_call.is_choice
+            # the value of the random choice
+            return choice_or_call.subtrace_or_retval
+        else
+            # the return value of the generative function call
+            return get_retval(choice_or_call.subtrace_or_retval)
+        end
+    else
+        error("No random choice or generative function call at address $addr")
+    end
+end
+
+function Base.getindex(trace::DynamicDSLTrace, addr)
+    _getindex(trace, trace.trie, addr)
 end

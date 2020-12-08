@@ -1,4 +1,4 @@
-@testset begin "dynamic selection"
+@testset "dynamic selection" begin
 
     s = select(:x, :y => :z, :y => :w)
 
@@ -33,7 +33,7 @@
     @test !(:x in selection)
 end
 
-@testset begin "all selection"
+@testset "all selection" begin
 
     s = selectall()
 
@@ -44,4 +44,26 @@ end
     # test Base.getindex
     @test s[:x] == AllSelection()
     @test s[:x => :y] == AllSelection()
+end
+
+@testset "complement selection" begin
+
+    @test !(:x in complement(selectall()))
+    @test :x in complement(select())
+
+    @test !(:x in complement(select(:x)))
+    @test :y in complement(select(:x))
+
+    @test :x in complement(select(:x => :y => :z))
+    @test (:x => :y) in complement(select(:x => :y => :z))
+    @test !((:x => :y => :z) in complement(select(:x => :y => :z)))
+
+    @test !(:x in complement(complement(select(:x => :y => :z))))
+    @test !((:x => :y) in complement(complement(select(:x => :y => :z))))
+    @test (:x => :y => :z) in complement(complement(select(:x => :y => :z)))
+
+    s = complement(select(:x => :y => :z))[:x]
+    @test !((:y => :z) in s)
+    @test :w in s
+    @test :y in s
 end

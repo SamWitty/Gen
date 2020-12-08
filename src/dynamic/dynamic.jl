@@ -12,59 +12,90 @@ struct DynamicDSLFunction{T} <: GenerativeFunction{T,DynamicDSLTrace}
     params_grad::Dict{Symbol,Any}
     params::Dict{Symbol,Any}
     arg_types::Vector{Type}
+    has_defaults::Bool
+    arg_defaults::Vector{Union{Some{Any},Nothing}}
     julia_function::Function
     has_argument_grads::Vector{Bool}
     accepts_output_grad::Bool
 end
 
 function DynamicDSLFunction(arg_types::Vector{Type},
+                     arg_defaults::Vector{Union{Some{Any},Nothing}},
                      julia_function::Function,
                      has_argument_grads, ::Type{T},
                      accepts_output_grad::Bool) where {T}
     params_grad = Dict{Symbol,Any}()
     params = Dict{Symbol,Any}()
+    has_defaults = any(arg -> arg != nothing, arg_defaults)
     DynamicDSLFunction{T}(params_grad, params, arg_types,
+                has_defaults, arg_defaults,
                 julia_function,
                 has_argument_grads, accepts_output_grad)
 end
 
-accepts_output_grad(gen_fn::DynamicDSLFunction) = gen_fn.accepts_output_grad
-
-function (gen_fn::DynamicDSLFunction)(args...)
-    (_, _, retval) = propose(gen_fn, args)
-    retval
+function DynamicDSLTrace(gen_fn::T, args) where {T<:DynamicDSLFunction}
+    # pad args with default values, if available
+    if gen_fn.has_defaults && length(args) < length(gen_fn.arg_defaults)
+        defaults = gen_fn.arg_defaults[length(args)+1:end]
+        defaults = map(x -> something(x), defaults)
+        args = Tuple(vcat(collect(args), defaults))
+    end
+    DynamicDSLTrace{T}(gen_fn, args)
 end
 
-function exec(gf::DynamicDSLFunction, state, args::Tuple)
-    gf.julia_function(state, args...)
+accepts_output_grad(gen_fn::DynamicDSLFunction) = gen_fn.accepts_output_grad
+
+mutable struct GFUntracedState
+    params::Dict{Symbol,Any}
+end
+
+function (gen_fn::DynamicDSLFunction)(args...)
+    state = GFUntracedState(gen_fn.params)
+    gen_fn.julia_function(state, args...)
+end
+
+function exec(gen_fn::DynamicDSLFunction, state, args::Tuple)
+    gen_fn.julia_function(state, args...)
 end
 
 # whether there is a gradient of score with respect to each argument
 # it returns 'nothing' for those arguemnts that don't have a derivatice
 has_argument_grads(gen::DynamicDSLFunction) = gen.has_argument_grads
 
+"Global reference to the GFI state for the dynamic modeling language."
 const state = gensym("state")
 
-macro trace(expr::Expr, addr)
-    if expr.head != :call
-        error("syntax error in @trace at $(expr)")
+"Implementation of @trace for the dynamic modeling language."
+function dynamic_trace_impl(expr::Expr)
+    @assert expr.head == :gentrace "Not a Gen trace expression."
+    call, addr = expr.args[1], expr.args[2]
+    if (call.head != :call) error("syntax error in @trace at $(call)") end
+    fn = call.args[1]
+    args = Expr(:tuple, call.args[2:end]...)
+    if addr != nothing
+        addr = something(addr)
+        return Expr(:call, GlobalRef(@__MODULE__, :traceat), state, fn, args, addr)
+    else
+        return Expr(:call, GlobalRef(@__MODULE__, :splice), state, fn, args)
     end
-    fn = esc(expr.args[1])
-    args = map(esc, expr.args[2:end])
-    Expr(:call, :traceat, esc(state), fn, Expr(:tuple, args...), esc(addr))
 end
 
-macro trace(expr::Expr)
-    if expr.head != :call
-        error("syntax error in @trace at $(expr)")
-    end
-    invocation = expr.args[1]
-    args = esc(Expr(:tuple, expr.args[2:end]...))
-    Expr(:call, :splice, esc(state), esc(invocation), args)
-end
+# Defaults for untraced execution
+@inline traceat(state::GFUntracedState, gen_fn::GenerativeFunction, args, key) =
+    gen_fn(args...)
 
-function address_not_found_error_msg(addr)
-    "Address $addr not found"
+@inline traceat(state::GFUntracedState, dist::Distribution, args, key) =
+    random(dist, args...)
+
+########################
+# trainable parameters #
+########################
+
+"Implementation of @param for the dynamic modeling language."
+function dynamic_param_impl(expr::Expr)
+    @assert expr.head == :genparam "Not a Gen param expression."
+    name = expr.args[1]
+    Expr(:(=), name, Expr(:call, GlobalRef(@__MODULE__, :read_param), state, QuoteNode(name)))
 end
 
 function read_param(state, name::Symbol)
@@ -73,23 +104,6 @@ function read_param(state, name::Symbol)
     else
         throw(UndefVarError(name))
     end
-end
-
-
-########################
-# trainable parameters #
-########################
-
-macro param(expr_or_symbol)
-    local name::Symbol
-    if isa(expr_or_symbol, Symbol)
-        name = expr_or_symbol
-    elseif expr_or_symbol.head == :(::)
-        name = expr_or_symbol.args[1]
-    else
-        error("Syntax in error in @static at $(expr_or_symbol)")
-    end
-    Expr(:(=), esc(name), Expr(:call, :read_param, esc(state), QuoteNode(name)))
 end
 
 ##################
@@ -168,6 +182,3 @@ include("regenerate.jl")
 include("backprop.jl")
 
 export DynamicDSLFunction
-export @param
-export @trace
-export @gen

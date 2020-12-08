@@ -1,10 +1,10 @@
 @testset "static assignment to/from array" begin
     submap = StaticChoiceMap((a=1., b=[2., 2.5]),NamedTuple())
     outer = StaticChoiceMap((c=3.,), (d=submap, e=submap))
-    
+
     arr = to_array(outer, Float64)
     @test to_array(outer, Float64) == Float64[3.0, 1.0, 2.0, 2.5, 1.0, 2.0, 2.5]
-    
+
     choices = from_array(outer, Float64[1, 2, 3, 4, 5, 6, 7])
     @test choices[:c] == 1.0
     @test choices[:d => :a] == 2.0
@@ -29,10 +29,10 @@ end
     set_value!(submap, :b, [2., 2.5])
     set_submap!(outer, :d, submap)
     set_submap!(outer, :e, submap)
-    
+
     arr = to_array(outer, Float64)
     @test to_array(outer, Float64) == Float64[3.0, 1.0, 2.0, 2.5, 1.0, 2.0, 2.5]
-    
+
     choices = from_array(outer, Float64[1, 2, 3, 4, 5, 6, 7])
     @test choices[:c] == 1.0
     @test choices[:d => :a] == 2.0
@@ -326,4 +326,50 @@ end
     @test a != c
     @test c != a
 
+end
+
+@testset "choice map nested view" begin
+    c = choicemap((:a, 1),
+                  (:b => :c, 2))
+    cv = nested_view(c)
+    @test c[:a] == cv[:a]
+    @test c[:b => :c] == cv[:b][:c]
+    # Base.length
+    @test length(cv) == 2
+    @test length(cv[:b]) == 1
+    # Base.keys
+    @test Set(keys(cv)) == Set([:a, :b])
+    @test Set(keys(cv[:b])) == Set([:c])
+    # Base.:(==)
+    c1 = choicemap((:a, 1),
+                   (:b => :c, 2))
+    c2 = choicemap((:a, 4),
+                   (:b => :c, 2))
+    @test nested_view(c1) == cv
+    @test nested_view(c2) != cv
+end
+
+@testset "filtering choicemaps with selections" begin
+
+    c = choicemap((:a, 1), (:b, 2))
+
+    filtered = get_selected(c, select(:a))
+    @test filtered[:a] == 1
+    @test !has_value(filtered, :b)
+
+    c = choicemap((:x => :y, 1), (:x => :z, 2))
+
+    filtered = get_selected(c, select(:x))
+    @test filtered[:x => :y] == 1
+    @test filtered[:x => :z] == 2
+
+    filtered = get_selected(c, select(:x => :y))
+    @test filtered[:x => :y] == 1
+    @test !has_value(filtered, :x => :z)
+end
+
+@testset "invalid choice map constructor" begin
+    threw = false
+    try c = choicemap((:a, 1, :b, 2)) catch Exception threw = true end
+    @test threw
 end

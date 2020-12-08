@@ -105,7 +105,7 @@ function traceat(state::GFBackpropParamsState, gen_fn::GenerativeFunction{T},
     record!(state.tape, ReverseDiff.SpecialInstruction,
         BackpropParamsRecord(gen_fn, subtrace, state.scale_factor),
         (args_maybe_tracked...,), retval_maybe_tracked)
-    retval_maybe_tracked 
+    retval_maybe_tracked
 end
 
 function splice(state::GFBackpropParamsState, gen_fn::DynamicDSLFunction,
@@ -113,7 +113,7 @@ function splice(state::GFBackpropParamsState, gen_fn::DynamicDSLFunction,
 
     # save previous tracked parameter scope
     prev_tracked_params = state.tracked_params
-    
+
     # construct new tracked parameter scope
     state.tracked_params = Dict{Symbol,Any}()
     for name in keys(gen_fn.params)
@@ -167,6 +167,21 @@ end
     nothing
 end
 
+function set_retval_grad!(gen_fn::DynamicDSLFunction, retval_maybe_tracked, retval_grad)
+    if accepts_output_grad(gen_fn)
+        if istracked(retval_maybe_tracked)
+            deriv!(retval_maybe_tracked, retval_grad)
+        end
+    else
+        error("Return value gradient not supported, but got gradient $retval_grad != nothing")
+    end
+end
+
+function set_retval_grad!(gen_fn::DynamicDSLFunction, retval_maybe_tracked, retval_grad::Nothing)
+    # don't accumulate the gradient for retval_maybe_tracked, if it is tracked
+end
+
+
 function accumulate_param_gradients!(trace::DynamicDSLTrace, retval_grad, scale_factor=1.)
     gen_fn = trace.gen_fn
     tape = new_tape()
@@ -175,23 +190,7 @@ function accumulate_param_gradients!(trace::DynamicDSLTrace, retval_grad, scale_
     args_maybe_tracked = (map(maybe_track,
         args, gen_fn.has_argument_grads, fill(tape, length(args)))...,)
     retval_maybe_tracked = exec(gen_fn, state, args_maybe_tracked)
-
-    # note: code duplication with choice_gradients
-    if accepts_output_grad(gen_fn)
-        if retval_grad == nothing
-            error("Return value gradient required but not provided")
-        end
-        if istracked(retval_maybe_tracked)
-            deriv!(retval_maybe_tracked, retval_grad)
-        end
-        # note: if accepts_output_grad(gen_fn) and
-        # !istracked(retval_maybe_tracked), this means the return value did not
-        # depend on the gradient source elements for this trace. that is okay.
-    else
-        if retval_grad != nothing
-            error("Return value gradient not supported, but got $retval_grad != nothing")
-        end
-    end
+    set_retval_grad!(gen_fn, retval_maybe_tracked, retval_grad)
     seed!(state.score)
     reverse_pass!(tape)
 
@@ -238,34 +237,38 @@ function GFBackpropTraceState(trace, selection, params, tape)
         selection, tracked_choices, value_choices, gradient_choices)
 end
 
-function fill_gradient_map!(gradient_choices::DynamicChoiceMap,
-                             tracked_trie::Trie{Any,Union{TrackedReal,TrackedArray}})
-    for (key, tracked) in get_leaf_nodes(tracked_trie)
-        set_value!(gradient_choices, key, deriv(tracked))
-    end
+function fill_submaps!(
+        map::DynamicChoiceMap,
+        tracked_trie::Trie{Any,Union{TrackedReal,TrackedArray}},
+        mode)
     # NOTE: there should be no address collision between these primitive
     # choices and the gen_fn invocations, as enforced by the visitor
     for (key, subtrie) in get_internal_nodes(tracked_trie)
-        @assert !has_value(gradient_choices, key) && isempty(get_submap(gradient_choices, key))
-        gradient_submap = choicemap()
-        fill_gradient_map!(gradient_submap, subtrie)
-        set_submap!(gradient_choices, key, gradient_submap)
+        @assert !has_value(map, key) && isempty(get_submap(map, key))
+        submap= choicemap()
+        fill_map!(submap, subtrie, mode)
+        set_submap!(map, key, submap)
     end
 end
 
-function fill_value_map!(value_choices::DynamicChoiceMap,
-                          tracked_trie::Trie{Any,Union{TrackedReal,TrackedArray}})
+function fill_map!(
+        map::DynamicChoiceMap,
+        tracked_trie::Trie{Any,Union{TrackedReal,TrackedArray}},
+        mode::Val{:gradient_map})
     for (key, tracked) in get_leaf_nodes(tracked_trie)
-        set_value!(value_choices, key, value(tracked))
+        set_value!(map, key, deriv(tracked))
     end
-    # NOTE: there should be no address collision between these primitive
-    # choices and the gen_fn invocations, as enforced by the visitor
-    for (key, subtrie) in get_internal_nodes(tracked_trie)
-        @assert !has_value(value_choices, key) && !isempty(get_submap(value_choices, key))
-        value_choices_submap = choicemap()
-        fill_value_map!(value_choices_submap, subtrie)
-        set_submap!(value_choices, key, value_choices_submap)
+    fill_submaps!(map, tracked_trie, mode)
+end
+
+function fill_map!(
+        map::DynamicChoiceMap,
+        tracked_trie::Trie{Any,Union{TrackedReal,TrackedArray}},
+        mode::Val{:value_map})
+    for (key, tracked) in get_leaf_nodes(tracked_trie)
+        set_value!(map, key, value(tracked))
     end
+    fill_submaps!(map, tracked_trie, mode)
 end
 
 function traceat(state::GFBackpropTraceState, dist::Distribution{T},
@@ -318,7 +321,7 @@ function traceat(state::GFBackpropTraceState, gen_fn::GenerativeFunction{T,U},
     record = BackpropTraceRecord(gen_fn, subtrace, selection, state.value_choices,
         state.gradient_choices, key)
     record!(state.tape, ReverseDiff.SpecialInstruction, record, (args_maybe_tracked...,), retval_maybe_tracked)
-    retval_maybe_tracked 
+    retval_maybe_tracked
 end
 
 function splice(state::GFBackpropTraceState, gen_fn::DynamicDSLFunction,
@@ -374,30 +377,13 @@ function choice_gradients(trace::DynamicDSLTrace, selection::Selection, retval_g
     args_maybe_tracked = (map(maybe_track,
         args, gen_fn.has_argument_grads, fill(tape, length(args)))...,)
     retval_maybe_tracked = exec(gen_fn, state, args_maybe_tracked)
-
-    # note: code duplication with accumulate_param_gradients!
-    if accepts_output_grad(gen_fn)
-        if retval_grad == nothing
-            error("Return value gradient required but not provided")
-        end
-        if istracked(retval_maybe_tracked)
-            deriv!(retval_maybe_tracked, retval_grad)
-        end
-        # note: if accepts_output_grad(gen_fn) and
-        # !istracked(retval_maybe_tracked), this means the return value did not
-        # depend on the gradient source elements for this trace. that is okay.
-    else
-        if retval_grad != nothing
-            error("Return value gradient not supported, but got $retval_grad != nothing")
-        end
-    end
-
+    set_retval_grad!(gen_fn, retval_maybe_tracked, retval_grad)
     seed!(state.score)
     reverse_pass!(tape)
 
     # fill trace gradient with gradients with respect to primitive random choices
-    fill_gradient_map!(state.gradient_choices, state.tracked_choices)
-    fill_value_map!(state.value_choices, state.tracked_choices)
+    fill_map!(state.gradient_choices, state.tracked_choices, Val{:gradient_map}())
+    fill_map!(state.value_choices, state.tracked_choices, Val{:value_map}())
 
     # return gradients with respect to arguments with gradients, or nothing
     # NOTE: if a value isn't tracked the gradient is nothing

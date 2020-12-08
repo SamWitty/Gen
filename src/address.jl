@@ -10,9 +10,9 @@ end
 
 Base.keys(schema::StaticAddressSchema) = schema.keys
 
-struct VectorAddressSchema <: AddressSchema end 
-struct SingleDynamicKeyAddressSchema <: AddressSchema end 
-struct DynamicAddressSchema <: AddressSchema end 
+struct VectorAddressSchema <: AddressSchema end
+struct SingleDynamicKeyAddressSchema <: AddressSchema end
+struct DynamicAddressSchema <: AddressSchema end
 struct EmptyAddressSchema <: AddressSchema end
 struct AllAddressSchema <: AddressSchema end
 
@@ -102,11 +102,38 @@ A singleton type for a selection that contains all choices at or under an addres
 """
 struct AllSelection <: Selection end
 get_address_schema(::Type{AllSelection}) = AllAddressSchema()
-Base.isempty(::AllSelection) = false
+Base.isempty(::AllSelection) = false # it is not guaranteed to be empty
 Base.in(addr, ::AllSelection) = true
 Base.getindex(::AllSelection, addr) = AllSelection()
 
 export AllSelection
+
+########################
+# complement selection #
+########################
+
+struct ComplementSelection <: Selection
+    complement::Selection
+end
+get_address_schema(::Type{ComplementSelection}) = DynamicAddressSchema()
+Base.isempty(::ComplementSelection) = false # it is not guaranteed to be empty
+Base.in(addr, selection::ComplementSelection) = !(addr in selection.complement)
+function Base.getindex(selection::ComplementSelection, addr)
+    ComplementSelection(selection.complement[addr])
+end
+
+"""
+    comp_selection = complement(selection::Selection)
+
+Return a selection that is the complement of the given selection.
+
+An address is in the selection if it is not in the complement selection.
+"""
+function complement(selection::Selection)
+    ComplementSelection(selection)
+end
+
+export ComplementSelection, complement
 
 ####################
 # static selection #
@@ -156,7 +183,7 @@ end
 function Base.getindex(selection::StaticSelection, addr::Pair)
     (first, rest) = addr
     subselection = selection.subselections[first]
-    get_subselection(subselection, rest)
+    subselection[rest]
 end
 
 function Base.in(addr::Symbol, selection::StaticSelection{T,U}) where {T,U}
@@ -288,7 +315,7 @@ function Base.push!(selection::DynamicSelection, addr::Pair)
         subselection = selection.subselections[first]
     else
         subselection = DynamicSelection()
-        selection.subselections[first] = subselection 
+        selection.subselections[first] = subselection
     end
     push!(subselection, rest)
 end
@@ -303,7 +330,7 @@ function set_subselection!(selection::DynamicSelection, addr::Pair, other::Selec
         subselection = selection.subselections[first]
     else
         subselection = DynamicSelection()
-        selection.subselections[first] = subselection 
+        selection.subselections[first] = subselection
     end
     set_subselection!(subselection, rest, other)
 end

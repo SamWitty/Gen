@@ -299,7 +299,7 @@ end
         #out = @trace(normal(c, 1), :out)
         #return out
     #end
-    
+
     # foo
     builder = StaticIRBuilder()
     mu_a = add_argument_node!(builder, name=:mu_a, typ=:Float64, compute_grad=true)
@@ -552,6 +552,19 @@ Gen.load_generated_functions()
     counter = 0
     regenerate(trace, (1, 3), (NoChange(), UnknownChange()), select(:x))
     @test counter == 1
+end
+
+@testset "regression test for https://github.com/probcomp/Gen/issues/168" begin
+    @gen (static) function model(var)
+        mean = @trace(normal(0, 1), :mean)
+        T = @trace(normal(mean, var), :T)
+        return T
+    end
+    load_generated_functions()
+    selection = StaticSelection(select(:mean))
+    (tr, _) = generate(model, (1,))
+    # At the time the issue was filed, this line produced a crash
+    (tr, ) = mh(tr, selection)
 end
 
 end # @testset "static IR"

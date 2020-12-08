@@ -120,7 +120,7 @@ function regenerate(trace::ChoiceAtTrace, args::Tuple, argdiffs::Tuple,
     (key, kernel_args) = unpack_choice_at_args(args)
     key_changed = (key != trace.key)
     selected = key in selection
-    if !key_changed && selected 
+    if !key_changed && selected
         new_value = random(trace.gen_fn.dist, kernel_args...)
     elseif !key_changed && !selected
         new_value = trace.value
@@ -130,7 +130,7 @@ function regenerate(trace::ChoiceAtTrace, args::Tuple, argdiffs::Tuple,
         error("Cannot select new address $key in regenerate")
     end
     new_score = logpdf(trace.gen_fn.dist, new_value, kernel_args...)
-    if !key_changed && selected 
+    if !key_changed && selected
         weight = 0.
     elseif !key_changed && !selected
         weight = new_score - trace.score
@@ -142,9 +142,7 @@ function regenerate(trace::ChoiceAtTrace, args::Tuple, argdiffs::Tuple,
 end
 
 function choice_gradients(trace::ChoiceAtTrace, selection::Selection, retval_grad)
-    if retval_grad == nothing && accepts_output_grad(trace.gen_fn)
-        error("return value gradient required but not provided")
-    elseif retval_grad != nothing && !accepts_output_grad(trace.gen_fn)
+    if retval_grad != nothing && !has_output_grad(trace.gen_fn.dist)
         error("return value gradient not accepted but one was provided")
     end
     kernel_arg_grads = logpdf_grad(trace.gen_fn.dist, trace.value, trace.kernel_args...)
@@ -167,9 +165,7 @@ function choice_gradients(trace::ChoiceAtTrace, selection::Selection, retval_gra
 end
 
 function accumulate_param_gradients!(trace::ChoiceAtTrace, retval_grad)
-    if retval_grad == nothing && accepts_output_grad(trace.gen_fn)
-        error("return value gradient required but not provided")
-    elseif retval_grad != nothing && !accepts_output_grad(trace.gen_fn)
+    if retval_grad != nothing && !has_output_grad(trace.gen_fn.dist)
         error("return value gradient not accepted but one was provided")
     end
     kernel_arg_grads = logpdf_grad(trace.gen_fn.dist, trace.value, trace.kernel_args...)
